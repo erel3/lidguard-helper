@@ -1,39 +1,78 @@
 #!/bin/bash
-# Post-install script for lidguard-helper PKG
-# Runs as root during PKG installation
-# $1 = package path, $2 = install target location
+set -euo pipefail
 
-# Get the real console user (not root)
+# Post-install script for lidguard-helper PKG
+# Runs as root. $2 = install target (where PKG extracted payload).
+
+LABEL="com.lidguard.helper"
+
+# ── Resolve console user (not root) ─────────────────────────────────
 USERNAME=$(/usr/bin/stat -f '%Su' /dev/console)
-USER_HOME=$(dscl . -read /Users/"$USERNAME" NFSHomeDirectory | awk '{print $2}')
-UID_NUM=$(id -u "$USERNAME")
+if [ "$USERNAME" = "root" ] || [ -z "$USERNAME" ]; then
+  echo "postinstall: ERROR — could not determine console user" >&2
+  exit 1
+fi
+USER_HOME=$(/usr/bin/dscl . -read /Users/"$USERNAME" NFSHomeDirectory | /usr/bin/awk '{print $2}')
+UID_NUM=$(/usr/bin/id -u "$USERNAME")
 
 PAYLOAD="$2"
 INSTALL_DIR="$USER_HOME/Library/Application Support/LidGuard"
-PLIST_DST="$USER_HOME/Library/LaunchAgents/com.lidguard.helper.plist"
+PLIST_DST="$USER_HOME/Library/LaunchAgents/$LABEL.plist"
 
-echo "postinstall: PAYLOAD=$PAYLOAD USER=$USERNAME HOME=$USER_HOME"
+echo "postinstall: user=$USERNAME home=$USER_HOME payload=$PAYLOAD"
 
-# Install binary
-mkdir -p "$INSTALL_DIR"
-cp "$PAYLOAD/lidguard-helper" "$INSTALL_DIR/"
-chown "$USERNAME" "$INSTALL_DIR/lidguard-helper"
-chmod 755 "$INSTALL_DIR/lidguard-helper"
+# ── Verify payload ──────────────────────────────────────────────────
+if [ ! -f "$PAYLOAD/lidguard-helper" ] || [ ! -f "$PAYLOAD/$LABEL.plist" ]; then
+  echo "postinstall: ERROR — payload files missing at $PAYLOAD" >&2
+  exit 1
+fi
 
-# Install and resolve LaunchAgent plist
-mkdir -p "$USER_HOME/Library/LaunchAgents"
-sed "s|INSTALL_PATH|$INSTALL_DIR|g" "$PAYLOAD/com.lidguard.helper.plist" > "$PLIST_DST"
-chown "$USERNAME" "$PLIST_DST"
+# ── Unload old daemon (best effort) ────────────────────────────────
+/bin/launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+sleep 1
 
-# Load LaunchAgent
-sudo -u "$USERNAME" launchctl bootout "gui/$UID_NUM" "$PLIST_DST" 2>/dev/null
-sudo -u "$USERNAME" launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST"
+# ── Install binary ──────────────────────────────────────────────────
+/bin/mkdir -p "$INSTALL_DIR"
+/bin/cp -f "$PAYLOAD/lidguard-helper" "$INSTALL_DIR/"
+/usr/sbin/chown -R "$USERNAME:staff" "$INSTALL_DIR"
+/bin/chmod 755 "$INSTALL_DIR/lidguard-helper"
 
-# Install sudoers for passwordless pmset
-cat > /etc/sudoers.d/lidguard <<SUDOERS
-$USERNAME ALL = NOPASSWD: /usr/bin/pmset -a disablesleep 1
-$USERNAME ALL = NOPASSWD: /usr/bin/pmset -a disablesleep 0
-SUDOERS
-chmod 440 /etc/sudoers.d/lidguard
+# ── Install LaunchAgent plist (resolve INSTALL_PATH placeholder) ────
+/bin/mkdir -p "$USER_HOME/Library/LaunchAgents"
+/usr/bin/sed "s|INSTALL_PATH|$INSTALL_DIR|g" "$PAYLOAD/$LABEL.plist" > "$PLIST_DST"
+/usr/sbin/chown "$USERNAME:staff" "$PLIST_DST"
+/bin/chmod 644 "$PLIST_DST"
+
+# ── Load LaunchAgent ────────────────────────────────────────────────
+# Try multiple methods — installer sandbox may block some
+if ! /bin/launchctl bootstrap "gui/$UID_NUM" "$PLIST_DST" 2>/dev/null; then
+  # Fallback: enable + kickstart (works in some sandbox contexts)
+  /bin/launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+  /bin/launchctl kickstart "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+fi
+
+# Verify loaded (non-fatal if not — app will trigger on-demand via socket)
+if /bin/launchctl print "gui/$UID_NUM/$LABEL" &>/dev/null; then
+  echo "postinstall: LaunchAgent loaded"
+else
+  echo "postinstall: WARNING — LaunchAgent not loaded (will start on next connection or login)"
+fi
+
+# ── Install sudoers for passwordless pmset ──────────────────────────
+SUDOERS_FILE="/etc/sudoers.d/lidguard"
+/bin/mkdir -p /etc/sudoers.d
+printf '%s ALL = NOPASSWD: /usr/bin/pmset -a disablesleep 1\n' "$USERNAME" > "$SUDOERS_FILE"
+printf '%s ALL = NOPASSWD: /usr/bin/pmset -a disablesleep 0\n' "$USERNAME" >> "$SUDOERS_FILE"
+/bin/chmod 440 "$SUDOERS_FILE"
+if /usr/sbin/visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
+  echo "postinstall: sudoers installed"
+else
+  echo "postinstall: WARNING — sudoers validation failed, removing" >&2
+  /bin/rm -f "$SUDOERS_FILE"
+fi
+
+# ── Clean staging ───────────────────────────────────────────────────
+/bin/rm -rf "$PAYLOAD"
 
 echo "postinstall: done"
+exit 0
