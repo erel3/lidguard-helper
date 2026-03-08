@@ -202,6 +202,8 @@ final class TCPServer {
 
   private func dispatchMainThreadCommand(_ cmd: IPCCommand, fileDescriptor: Int32) {
     switch cmd.type {
+    case "lock_screen":
+      lockSystemScreen()
     case "show_lock_screen":
       let name = cmd.contactName ?? ""
       let phone = cmd.contactPhone ?? ""
@@ -226,6 +228,15 @@ final class TCPServer {
   private func runOnMain(_ block: @escaping () -> Void) {
     CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue, block)
     CFRunLoopWakeUp(CFRunLoopGetMain())
+  }
+
+  private func lockSystemScreen() {
+    let libHandle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY)
+    guard libHandle != nil else { return }
+    guard let sym = dlsym(libHandle, "SACLockScreenImmediate") else { return }
+    typealias LockFunction = @convention(c) () -> Void
+    let lock = unsafeBitCast(sym, to: LockFunction.self)
+    lock()
   }
 
   private func sendStatus(to fileDescriptor: Int32) {
