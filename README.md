@@ -48,10 +48,10 @@ The daemon is **not always running**. `launchd` listens on port 51423 and starts
 ```bash
 git clone https://github.com/Erel3/lidguard-helper.git
 cd lidguard-helper
-make build          # Swift release build
-make install        # install binary + LaunchAgent, load via launchctl
-make uninstall      # unload and remove
-make lint           # run swiftlint
+just build          # Swift release build
+just install        # install binary + LaunchAgent, load via launchctl
+just uninstall      # unload and remove
+just lint           # run swiftlint
 ```
 
 ### Install Location
