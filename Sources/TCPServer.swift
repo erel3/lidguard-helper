@@ -11,6 +11,7 @@ final class TCPServer {
   private let pmsetManager: PmsetManager
   private let lockScreenManager: LockScreenManager
   private let powerButtonMonitor: PowerButtonMonitor
+  private let motionMonitor: MotionMonitor
   private let version: String
 
   var activeConnections: Int { connections.count }
@@ -20,12 +21,14 @@ final class TCPServer {
     pmsetManager: PmsetManager,
     lockScreenManager: LockScreenManager,
     powerButtonMonitor: PowerButtonMonitor,
+    motionMonitor: MotionMonitor,
     version: String
   ) {
     self.authManager = authManager
     self.pmsetManager = pmsetManager
     self.lockScreenManager = lockScreenManager
     self.powerButtonMonitor = powerButtonMonitor
+    self.motionMonitor = motionMonitor
     self.version = version
   }
 
@@ -218,6 +221,10 @@ final class TCPServer {
       runOnMain { [self] in powerButtonMonitor.start() }
     case "disable_power_button":
       runOnMain { [self] in powerButtonMonitor.stop() }
+    case "start_motion_monitoring":
+      runOnMain { [self] in _ = motionMonitor.start() }
+    case "stop_motion_monitoring":
+      runOnMain { [self] in motionMonitor.stop() }
     default:
       send(.error("Unknown command: \(cmd.type)"), to: fileDescriptor)
       return
@@ -244,7 +251,10 @@ final class TCPServer {
       pmset: pmsetManager.isEnabled,
       lockScreen: lockScreenManager.isShowing,
       powerButton: powerButtonMonitor.isMonitoring,
-      accessibilityGranted: AXIsProcessTrusted()
+      accessibilityGranted: AXIsProcessTrusted(),
+      motion: motionMonitor.isMonitoring,
+      motionSupported: motionMonitor.isHardwareSupported,
+      motionSession: motionMonitor.currentSession
     )
     send(status, to: fileDescriptor)
   }

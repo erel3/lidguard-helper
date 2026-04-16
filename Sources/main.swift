@@ -25,16 +25,42 @@ let helperVersion = "1.0.11"
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
+// `--sensor-only` mode: skip the TCP server (no port conflict with the
+// installed helper), just run motion detection and print events.
+// `--sensor-only --verbose` additionally prints live tilt + RMS every 1 s.
+if CommandLine.arguments.contains("--sensor-only") {
+  let verboseMode = CommandLine.arguments.contains("--verbose")
+  print("[Helper] Sensor-only debug mode (no TCP server, verbose=\(verboseMode))")
+  let motionMonitor = MotionMonitor()
+  motionMonitor.verbose = verboseMode
+  motionMonitor.onMotionDetected = { detail, session in
+    print("[Debug] >>> motion detected (\(detail)) session=\(session) <<<")
+  }
+  _ = motionMonitor.start()
+  signal(SIGINT, SIG_IGN)
+  let sigInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+  sigInt.setEventHandler {
+    print("[Helper] SIGINT, stopping sensor")
+    motionMonitor.stop()
+    exit(0)
+  }
+  sigInt.resume()
+  app.run()
+  exit(0)
+}
+
 let authManager = AuthManager()
 let pmsetManager = PmsetManager()
 let lockScreenManager = LockScreenManager()
 let powerButtonMonitor = PowerButtonMonitor()
+let motionMonitor = MotionMonitor()
 
 let server = TCPServer(
   authManager: authManager,
   pmsetManager: pmsetManager,
   lockScreenManager: lockScreenManager,
   powerButtonMonitor: powerButtonMonitor,
+  motionMonitor: motionMonitor,
   version: helperVersion
 )
 
@@ -42,6 +68,20 @@ let server = TCPServer(
 powerButtonMonitor.onPowerButtonPressed = { [weak server] in
   server?.broadcast(.powerButtonPressed())
 }
+
+// Wire motion callback to broadcast
+motionMonitor.onMotionDetected = { [weak server] detail, session in
+  server?.broadcast(.motionDetected(detail: detail, session: session))
+}
+
+// Observe system wake so MotionMonitor can re-wake the SPU and recalibrate.
+let wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+  forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+) { [weak motionMonitor] _ in
+  print("[Helper] System did wake")
+  motionMonitor?.handleSystemDidWake()
+}
+_ = wakeObserver
 
 let launchdFD = getLaunchdSocket()
 server.start(existingFD: launchdFD)
@@ -59,6 +99,7 @@ idleTimer.setEventHandler {
       pmsetManager.disable()
       lockScreenManager.hide()
       powerButtonMonitor.stop()
+      motionMonitor.stop()
       exit(0)
     }
   } else {
@@ -76,6 +117,7 @@ sigSource.setEventHandler {
   pmsetManager.disable()
   lockScreenManager.hide()
   powerButtonMonitor.stop()
+  motionMonitor.stop()
   exit(0)
 }
 sigSource.resume()
