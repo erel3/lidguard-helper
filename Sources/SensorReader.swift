@@ -56,13 +56,6 @@ final class SensorReader {
 
   weak var delegate: SensorReaderDelegate?
 
-  /// Dedicated utility-QoS queue for all HID I/O. Keeps callbacks off the
-  /// main run loop (was previously scheduled on whatever thread called
-  /// `start()`, typically main via TCPServer's `runOnMain`).
-  private let sensorQueue = DispatchQueue(
-    label: "com.lidguard.helper.sensor",
-    qos: .utility
-  )
   private var manager: IOHIDManager?
   private var device: IOHIDDevice?
   private var reportBuffer: UnsafeMutablePointer<UInt8>
@@ -107,7 +100,7 @@ final class SensorReader {
       kIOHIDPrimaryUsageKey as String: SensorReader.sensorUsage
     ]
     IOHIDManagerSetDeviceMatching(mgr, matchingDict as CFDictionary)
-    IOHIDManagerSetDispatchQueue(mgr, sensorQueue)
+    IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
 
     guard let deviceSet = openAndEnumerate(mgr) else {
       manager = mgr
@@ -126,7 +119,6 @@ final class SensorReader {
     device = selected
     manager = mgr
 
-    IOHIDDeviceSetDispatchQueue(selected, sensorQueue)
     let context = Unmanaged.passUnretained(self).toOpaque()
     IOHIDDeviceRegisterInputReportCallback(
       selected,
@@ -136,11 +128,6 @@ final class SensorReader {
       context
     )
 
-    // Activate last — per IOKit dispatch-queue API contract, set up all
-    // handlers before activating. Callbacks begin firing on sensorQueue.
-    IOHIDDeviceActivate(selected)
-    IOHIDManagerActivate(mgr)
-
     lastRateCheck = currentTimestamp()
     delegate?.sensorReader(self, didChangeConnectionState: true)
     print("[SensorReader] Streaming started")
@@ -148,16 +135,12 @@ final class SensorReader {
   }
 
   func stop() {
-    // Cancel on the sensorQueue synchronously so no in-flight callback
-    // can fire after we return. `IOHIDDeviceCancel` / `IOHIDManagerCancel`
-    // ensure any pending report is drained before returning.
     if let dev = device {
       IOHIDDeviceRegisterInputReportCallback(dev, reportBuffer, SensorReader.bufferSize, nil, nil)
-      IOHIDDeviceCancel(dev)
       device = nil
     }
     if let mgr = manager {
-      IOHIDManagerCancel(mgr)
+      IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
       IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
       manager = nil
     }
