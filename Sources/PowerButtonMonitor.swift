@@ -8,6 +8,8 @@ final class PowerButtonMonitor {
   private var globalMonitor: Any?
   private var localMonitor: Any?
   nonisolated(unsafe) private(set) var isMonitoring = false
+  private var lastFireTime: CFAbsoluteTime = 0
+  private static let dedupWindow: CFAbsoluteTime = 0.5
 
   func start() {
     guard globalMonitor == nil else { return }
@@ -49,8 +51,12 @@ final class PowerButtonMonitor {
     let keyCode = (data1 & 0xFFFF0000) >> 16
 
     let isPowerButton = (subtype == 16) || (subtype == 8 && keyCode == 0x7F)
-    if isPowerButton {
-      onPowerButtonPressed?()
-    }
+    guard isPowerButton else { return }
+    // Global + local monitors both fire for the same event — dedup inside a
+    // short window so downstream callers see one press per physical press.
+    let now = CFAbsoluteTimeGetCurrent()
+    guard now - lastFireTime > Self.dedupWindow else { return }
+    lastFireTime = now
+    onPowerButtonPressed?()
   }
 }
