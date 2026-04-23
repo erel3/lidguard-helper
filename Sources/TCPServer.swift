@@ -15,6 +15,9 @@ final class TCPServer: @unchecked Sendable {
   private let motionMonitor: MotionMonitor
   private let version: String
 
+  /// Max bytes buffered per connection before we disconnect a misbehaving peer.
+  private static let maxBufferBytes = 256 * 1024
+
   var activeConnections: Int {
     queue.sync { connections.count }
   }
@@ -35,13 +38,14 @@ final class TCPServer: @unchecked Sendable {
     self.version = version
   }
 
-  func start(existingFD: Int32?) {
+  func start(existingFD: Int32?) -> Bool {
     let listenFD: Int32
     if let existing = existingFD {
       listenFD = existing
       print("[TCPServer] Using launchd socket FD \(existing)")
     } else {
-      listenFD = bindSocket(port: 51423)
+      guard let boundFD = bindSocket(port: 51423) else { return false }
+      listenFD = boundFD
       print("[TCPServer] Bound to port 51423")
     }
 
@@ -58,6 +62,7 @@ final class TCPServer: @unchecked Sendable {
     }
     source.resume()
     listenSource = source
+    return true
   }
 
   func broadcast(_ message: IPCMessage) {
@@ -70,10 +75,11 @@ final class TCPServer: @unchecked Sendable {
 
   // MARK: - Socket Setup
 
-  private func bindSocket(port: UInt16) -> Int32 {
+  private func bindSocket(port: UInt16) -> Int32? {
     let socketFD = socket(AF_INET, SOCK_STREAM, 0)
     guard socketFD >= 0 else {
-      fatalError("[TCPServer] Failed to create socket")
+      print("[TCPServer] Failed to create socket: \(String(cString: strerror(errno)))")
+      return nil
     }
 
     var yes: Int32 = 1
@@ -91,7 +97,9 @@ final class TCPServer: @unchecked Sendable {
       }
     }
     guard bindResult == 0 else {
-      fatalError("[TCPServer] Failed to bind port \(port): \(String(cString: strerror(errno)))")
+      print("[TCPServer] Failed to bind port \(port): \(String(cString: strerror(errno)))")
+      close(socketFD)
+      return nil
     }
     return socketFD
   }
@@ -136,13 +144,31 @@ final class TCPServer: @unchecked Sendable {
   private func readData(fileDescriptor: Int32) {
     var buf = [UInt8](repeating: 0, count: 4096)
     let bytesRead = read(fileDescriptor, &buf, buf.count)
-    guard bytesRead > 0 else {
+    if bytesRead > 0 {
+      guard var conn = connections[fileDescriptor] else { return }
+      conn.buffer.append(contentsOf: buf[0..<bytesRead])
+      if conn.buffer.count > Self.maxBufferBytes {
+        print("[TCPServer] Peer fd=\(fileDescriptor) exceeded buffer limit — disconnecting")
+        connections[fileDescriptor] = conn
+        removeConnection(fileDescriptor)
+        return
+      }
+      connections[fileDescriptor] = conn
+      processLines(fileDescriptor: fileDescriptor)
+      return
+    }
+    if bytesRead == 0 {
+      // Peer closed cleanly.
       removeConnection(fileDescriptor)
       return
     }
-
-    connections[fileDescriptor]?.buffer.append(contentsOf: buf[0..<bytesRead])
-    processLines(fileDescriptor: fileDescriptor)
+    // bytesRead < 0: transient errors keep the connection, hard errors drop it.
+    switch errno {
+    case EAGAIN, EINTR:
+      return
+    default:
+      removeConnection(fileDescriptor)
+    }
   }
 
   private func processLines(fileDescriptor: Int32) {
@@ -171,12 +197,43 @@ final class TCPServer: @unchecked Sendable {
           var json = String(data: data, encoding: .utf8) else { return }
     json += "\n"
     let bytes = Array(json.utf8)
-    _ = Darwin.write(fileDescriptor, bytes, bytes.count)
+    writeAll(fileDescriptor: fileDescriptor, bytes: bytes)
   }
 
-  // MARK: - Command Dispatch
+  /// Blocking-ish write loop that handles short writes and EAGAIN/EINTR.
+  /// On hard failure, cancels the connection.
+  private func writeAll(fileDescriptor: Int32, bytes: [UInt8]) {
+    var offset = 0
+    let total = bytes.count
+    while offset < total {
+      let remaining = total - offset
+      let wrote = bytes.withUnsafeBufferPointer { ptr -> Int in
+        guard let base = ptr.baseAddress else { return -1 }
+        return Darwin.write(fileDescriptor, base.advanced(by: offset), remaining)
+      }
+      if wrote > 0 { offset += wrote; continue }
+      if wrote < 0 {
+        if errno == EINTR { continue }
+        if errno == EAGAIN {
+          var delay = timespec(tv_sec: 0, tv_nsec: 1_000_000)
+          _ = nanosleep(&delay, nil)
+          continue
+        }
+        print("[TCPServer] write fd=\(fileDescriptor) failed: \(String(cString: strerror(errno)))")
+        removeConnection(fileDescriptor)
+        return
+      }
+      removeConnection(fileDescriptor)
+      return
+    }
+  }
 
-  private func handleMessage(_ json: String, fileDescriptor: Int32) {
+}
+
+// MARK: - Command Dispatch
+
+extension TCPServer {
+  fileprivate func handleMessage(_ json: String, fileDescriptor: Int32) {
     guard let data = json.data(using: .utf8),
           let cmd = try? JSONDecoder().decode(IPCCommand.self, from: data) else {
       send(.error("Invalid JSON"), to: fileDescriptor)
@@ -206,43 +263,54 @@ final class TCPServer: @unchecked Sendable {
     }
   }
 
-  private func dispatchMainThreadCommand(_ cmd: IPCCommand, fileDescriptor: Int32) {
+  fileprivate func dispatchMainThreadCommand(_ cmd: IPCCommand, fileDescriptor: Int32) {
     let lockScreenManager = self.lockScreenManager
     let powerButtonMonitor = self.powerButtonMonitor
     let motionMonitor = self.motionMonitor
+
+    // Runs on main, then replies from tcp queue so status reflects post-command state.
+    let replyAfter: @MainActor () -> Void
     switch cmd.type {
     case "lock_screen":
-      lockSystemScreen()
+      replyAfter = { [weak self] in
+        self?.lockSystemScreen()
+      }
     case "show_lock_screen":
       let name = cmd.contactName ?? ""
       let phone = cmd.contactPhone ?? ""
       let msg = cmd.message ?? "STOLEN DEVICE"
-      runOnMain { lockScreenManager.show(contactName: name, contactPhone: phone, message: msg) }
+      replyAfter = { lockScreenManager.show(contactName: name, contactPhone: phone, message: msg) }
     case "hide_lock_screen":
-      runOnMain { lockScreenManager.hide() }
+      replyAfter = { lockScreenManager.hide() }
     case "enable_power_button":
-      runOnMain { powerButtonMonitor.start() }
+      replyAfter = { powerButtonMonitor.start() }
     case "disable_power_button":
-      runOnMain { powerButtonMonitor.stop() }
+      replyAfter = { powerButtonMonitor.stop() }
     case "start_motion_monitoring":
-      runOnMain { _ = motionMonitor.start() }
+      replyAfter = { _ = motionMonitor.start() }
     case "stop_motion_monitoring":
-      runOnMain { motionMonitor.stop() }
+      replyAfter = { motionMonitor.stop() }
     default:
       send(.error("Unknown command: \(cmd.type)"), to: fileDescriptor)
       return
     }
-    sendStatus(to: fileDescriptor)
+
+    runOnMain { [weak self] in
+      replyAfter()
+      self?.queue.async { [weak self] in
+        self?.sendStatus(to: fileDescriptor)
+      }
+    }
   }
 
-  private func runOnMain(_ block: @escaping @MainActor () -> Void) {
+  fileprivate func runOnMain(_ block: @escaping @MainActor () -> Void) {
     CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
       MainActor.assumeIsolated { block() }
     }
     CFRunLoopWakeUp(CFRunLoopGetMain())
   }
 
-  private func lockSystemScreen() {
+  fileprivate func lockSystemScreen() {
     let libHandle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY)
     guard libHandle != nil else { return }
     guard let sym = dlsym(libHandle, "SACLockScreenImmediate") else { return }
@@ -251,7 +319,7 @@ final class TCPServer: @unchecked Sendable {
     lock()
   }
 
-  private func sendStatus(to fileDescriptor: Int32) {
+  fileprivate func sendStatus(to fileDescriptor: Int32) {
     let status = IPCMessage.status(
       pmset: pmsetManager.isEnabled,
       lockScreen: lockScreenManager.isShowing,

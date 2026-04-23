@@ -10,6 +10,9 @@ func getLaunchdSocket() -> Int32? {
   guard result == 0, count > 0 else {
     if result != 0 {
       print("[Helper] Not launchd-managed (err=\(result)), will bind directly")
+    } else {
+      // result==0 but no sockets — free the allocation launchd wrote.
+      free(fds)
     }
     return nil
   }
@@ -87,34 +90,8 @@ let wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
 }
 _ = wakeObserver
 
-let launchdFD = getLaunchdSocket()
-server.start(existingFD: launchdFD)
-
-// MARK: - Idle Timeout
-
-nonisolated(unsafe) var idleSeconds: Int = 0
-let idleTimer = DispatchSource.makeTimerSource(queue: .main)
-idleTimer.schedule(deadline: .now() + 5, repeating: 5)
-idleTimer.setEventHandler {
-  MainActor.assumeIsolated {
-    if server.activeConnections == 0 {
-      idleSeconds += 5
-      if idleSeconds >= 30 {
-        print("[Helper] Idle timeout (30s), exiting")
-        pmsetManager.disable()
-        lockScreenManager.hide()
-        powerButtonMonitor.stop()
-        motionMonitor.stop()
-        exit(0)
-      }
-    } else {
-      idleSeconds = 0
-    }
-  }
-}
-idleTimer.resume()
-
-// MARK: - Signal Handling
+// MARK: - Signal Handling (install BEFORE server.start so SIGTERM during
+// startup runs cleanup instead of the default handler).
 
 signal(SIGTERM, SIG_IGN)
 let sigSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -129,6 +106,41 @@ sigSource.setEventHandler {
   }
 }
 sigSource.resume()
+
+let launchdFD = getLaunchdSocket()
+guard server.start(existingFD: launchdFD) else {
+  print("[Helper] TCP server failed to start — exiting")
+  exit(1)
+}
+
+// MARK: - Idle Timeout
+
+// Require TWO consecutive idle ticks at zero before exiting, so a connection
+// arriving between ticks doesn't get dropped by a preemptive exit at t=30s.
+nonisolated(unsafe) var idleSeconds: Int = 0
+nonisolated(unsafe) var consecutiveIdleTicks: Int = 0
+let idleTimer = DispatchSource.makeTimerSource(queue: .main)
+idleTimer.schedule(deadline: .now() + 5, repeating: 5)
+idleTimer.setEventHandler {
+  MainActor.assumeIsolated {
+    if server.activeConnections == 0 {
+      consecutiveIdleTicks += 1
+      idleSeconds += 5
+      if idleSeconds >= 30 && consecutiveIdleTicks >= 2 {
+        print("[Helper] Idle timeout (30s, \(consecutiveIdleTicks) ticks), exiting")
+        pmsetManager.disable()
+        lockScreenManager.hide()
+        powerButtonMonitor.stop()
+        motionMonitor.stop()
+        exit(0)
+      }
+    } else {
+      idleSeconds = 0
+      consecutiveIdleTicks = 0
+    }
+  }
+}
+idleTimer.resume()
 
 print("[Helper] Started v\(helperVersion) (pid=\(getpid()))")
 
