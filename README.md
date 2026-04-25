@@ -26,7 +26,8 @@
 
 🛡️ **Clamshell Sleep Prevention** — `sudo pmset disablesleep` via sudoers\
 🔒 **Lock Screen Overlay** — fullscreen "STOLEN DEVICE" window via SkyLight private API\
-⚡ **Power Button Detection** — NSEvent system-defined events (requires Accessibility)
+⚡ **Power Button Detection** — NSEvent system-defined events (requires Accessibility)\
+🤚 **Motion Detection** — tilt + walking detector reading the Apple Silicon accelerometer (Bosch BMI286 IMU) via IOKit HID at ~800 Hz; root-only, hence run from the helper
 
 ## How It Works
 
@@ -34,10 +35,13 @@
 LidGuard app ──TCP──▶ launchd ──socket activation──▶ lidguard-helper
                        port 51423                      ├─ pmset
                        JSON + shared secret auth       ├─ SkyLight overlay
-                                                       └─ power button monitor
+                                                       ├─ power button monitor
+                                                       └─ HID accelerometer (motion)
 
 Idle 30s → daemon exits → launchd restarts on next connection
 ```
+
+Motion detector decimates the raw ~800 Hz stream to ~20 Hz, calibrates a baseline gravity vector at start, then fires on either of two paths: **tilt** (gravity-vector angle vs. baseline exceeds threshold and sustains) or **walking** (RMS of `sample - baseline` over a sliding window exceeds threshold). A cooldown after each fire prevents re-reporting a single event.
 
 The daemon is **not always running**. `launchd` listens on port 51423 and starts the daemon only when the main app connects. Zero resource usage when LidGuard isn't active.
 
@@ -73,17 +77,19 @@ Newline-delimited JSON over localhost TCP port 51423.
 |:--------|:------------|
 | `auth` | Authenticate with shared secret (must be first) |
 | `enable_pmset` / `disable_pmset` | Toggle clamshell sleep prevention |
-| `show_lock_screen` / `hide_lock_screen` | Toggle lock screen overlay |
+| `show_lock_screen` / `hide_lock_screen` | Toggle lock screen overlay (carries `contactName`/`contactPhone`/`message`) |
 | `enable_power_button` / `disable_power_button` | Toggle power button monitoring |
+| `start_motion_monitoring` / `stop_motion_monitoring` | Toggle accelerometer motion detection |
 | `get_status` | Query current state of all features |
 
 ### Events (Daemon → App)
 
 | Event | Description |
 |:------|:------------|
-| `auth_result` | Authentication success/failure |
-| `status` | Current state of pmset, lock screen, power button |
+| `auth_result` | Authentication success/failure (carries daemon `version`) |
+| `status` | Current state of pmset, lock screen, power button, motion (incl. `motionSupported` and per-start `motionSession` ID) |
 | `power_button_pressed` | Power button was pressed |
+| `motion_detected` | Motion fired; carries `motionDetail` (tilt/walking) and `motionSession` (drops events from earlier sessions across helper restarts) |
 | `error` | Error message |
 
 ## Permissions
@@ -92,6 +98,7 @@ Newline-delimited JSON over localhost TCP port 51423.
 |:-----------|:----|
 | **Accessibility** | Power button detection via NSEvent |
 | **Sudoers** | `pmset disablesleep` requires root |
+| **Root (via launchd)** | IOKit HID accelerometer access for motion detection |
 
 ## License
 
