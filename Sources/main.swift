@@ -21,7 +21,7 @@ func getLaunchdSocket() -> Int32? {
   return socketFD
 }
 
-let helperVersion = "1.2.2"
+let helperVersion = "1.2.3"
 
 // MARK: - Setup
 
