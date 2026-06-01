@@ -87,7 +87,10 @@ final class AuthManager: Sendable {
     count = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
     guard count > 0 else { return nil }
 
-    for idx in 0..<Int(count) {
+    // Clamp to buffer size: more processes can spawn between the sizing call and
+    // the fill call, so the second `count` may exceed the buffer we allocated.
+    // Iterating past `pids.count` would be an out-of-bounds read.
+    for idx in 0..<min(Int(count), pids.count) {
       let pid = pids[idx]
       guard pid > 0 else { continue }
       if checkProcessOwnsPort(pid: pid, port: targetPort) {
