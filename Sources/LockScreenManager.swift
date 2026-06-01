@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 import SkyLightWindow
 
@@ -75,15 +76,16 @@ final class LockScreenManager {
 // MARK: - ViewModel
 
 @MainActor
-class LockScreenViewModel: ObservableObject {
-  @Published var message: String = "STOLEN DEVICE"
-  @Published var contactInfo: String = ""
+@Observable
+final class LockScreenViewModel {
+  var message: String = "STOLEN DEVICE"
+  var contactInfo: String = ""
 }
 
 // MARK: - View
 
 struct LockScreenMessageView: View {
-  @ObservedObject var viewModel: LockScreenViewModel
+  let viewModel: LockScreenViewModel
 
   var body: some View {
     VStack(spacing: 16) {
