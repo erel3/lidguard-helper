@@ -250,6 +250,13 @@ extension TCPServer {
       let success = authManager.verifyPeer(fileDescriptor: fileDescriptor)
       connections[fileDescriptor]?.authenticated = success
       send(.authResult(success, version: success ? version : nil), to: fileDescriptor)
+      if !success {
+        // Terminal failure: drop the connection instead of letting a peer retry.
+        // verifyPeer runs an expensive proc_listallpids/proc_pidfdinfo scan;
+        // unbounded retries are a CPU-DoS vector and only aid a PID-reuse race.
+        // A legitimate client that hit a transient lookup miss will reconnect.
+        removeConnection(fileDescriptor)
+      }
     case "enable_pmset":
       pmsetManager.enable()
       sendStatus(to: fileDescriptor)
