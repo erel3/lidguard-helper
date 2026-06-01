@@ -311,10 +311,11 @@ extension TCPServer {
   }
 
   fileprivate func runOnMain(_ block: @escaping @MainActor () -> Void) {
-    CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
+    // Helper's main thread runs NSApplication.run(), which drains the main
+    // dispatch queue, so this lands on the same runloop CFRunLoopPerformBlock did.
+    DispatchQueue.main.async {
       MainActor.assumeIsolated { block() }
     }
-    CFRunLoopWakeUp(CFRunLoopGetMain())
   }
 
   fileprivate func lockSystemScreen() {
