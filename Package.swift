@@ -15,6 +15,14 @@ let package = Package(
       swiftSettings: [
         .swiftLanguageMode(.v6)
       ]
+    ),
+    .testTarget(
+      name: "lidguard-helperTests",
+      dependencies: ["lidguard-helper"],
+      path: "Tests/lidguard-helperTests",
+      swiftSettings: [
+        .swiftLanguageMode(.v6)
+      ]
     )
   ]
 )

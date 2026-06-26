@@ -17,6 +17,10 @@ version := `cat VERSION 2>/dev/null || echo "1.0.0"`
 build:
     swift build -c release
 
+# Run unit tests (SwiftPM test target)
+test *ARGS:
+    swift test {{ARGS}}
+
 # Build debug binary and run directly
 run-debug:
     swift build && .build/debug/{{app_name}}
