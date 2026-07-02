@@ -4,6 +4,10 @@ import Security
 final class AuthManager: Sendable {
   private let teamID = "73R36N2A46"
   private let appIdentifier = "com.akim.lidguard"
+  /// Our listen port. A peer socket is only accepted if its *foreign* endpoint
+  /// is exactly 127.0.0.1:<listenPort> — see `socketMatchesConnection`.
+  private let listenPort: UInt16 = 51423
+  private let loopbackAddr: in_addr_t = inet_addr("127.0.0.1")
 
   func verifyPeer(fileDescriptor: Int32) -> Bool {
     guard let pid = findPeerPID(fileDescriptor: fileDescriptor) else {
@@ -62,10 +66,10 @@ final class AuthManager: Sendable {
   // MARK: - TCP Peer PID via libproc
 
   private func findPeerPID(fileDescriptor: Int32) -> pid_t? {
-    guard let remotePort = getRemotePort(fileDescriptor: fileDescriptor) else {
+    guard let peerPort = getRemotePort(fileDescriptor: fileDescriptor) else {
       return nil
     }
-    return findPIDByLocalPort(remotePort)
+    return findPIDForPeer(peerPort: peerPort)
   }
 
   private func getRemotePort(fileDescriptor: Int32) -> UInt16? {
@@ -76,11 +80,22 @@ final class AuthManager: Sendable {
         getpeername(fileDescriptor, sockPtr, &plen)
       }
     }
-    guard result == 0 else { return nil }
+    // Require the peer to actually be on loopback; getpeername gives us the
+    // remote (ephemeral) port that identifies the client's side of *this*
+    // connection.
+    guard result == 0, peer.sin_addr.s_addr == loopbackAddr else { return nil }
     return UInt16(bigEndian: peer.sin_port)
   }
 
-  private func findPIDByLocalPort(_ targetPort: UInt16) -> pid_t? {
+  /// Find the process that owns the peer end of our accepted connection.
+  ///
+  /// The peer socket is pinned by its full 4-tuple — local port == `peerPort`
+  /// AND foreign endpoint == 127.0.0.1:`listenPort` — not by local port alone.
+  /// The kernel guarantees 4-tuple uniqueness for established connections, so
+  /// exactly one process matches: the real peer. This closes the prior bypass
+  /// where a same-user process could `bind()` a colliding *local* port and be
+  /// mis-attributed as the signed app.
+  private func findPIDForPeer(peerPort: UInt16) -> pid_t? {
     var count = proc_listallpids(nil, 0)
     guard count > 0 else { return nil }
     var pids = [pid_t](repeating: 0, count: Int(count))
@@ -93,14 +108,14 @@ final class AuthManager: Sendable {
     for idx in 0..<min(Int(count), pids.count) {
       let pid = pids[idx]
       guard pid > 0 else { continue }
-      if checkProcessOwnsPort(pid: pid, port: targetPort) {
+      if processOwnsConnection(pid: pid, peerPort: peerPort) {
         return pid
       }
     }
     return nil
   }
 
-  private func checkProcessOwnsPort(pid: pid_t, port: UInt16) -> Bool {
+  private func processOwnsConnection(pid: pid_t, peerPort: UInt16) -> Bool {
     let bufSize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
     guard bufSize > 0 else { return false }
 
@@ -111,14 +126,16 @@ final class AuthManager: Sendable {
 
     for idx in 0..<realCount {
       guard fdInfos[idx].proc_fdtype == PROX_FDTYPE_SOCKET else { continue }
-      if socketMatchesPort(pid: pid, fdNum: fdInfos[idx].proc_fd, port: port) {
+      if socketMatchesConnection(pid: pid, fdNum: fdInfos[idx].proc_fd, peerPort: peerPort) {
         return true
       }
     }
     return false
   }
 
-  private func socketMatchesPort(pid: pid_t, fdNum: Int32, port: UInt16) -> Bool {
+  /// True only if this fd is the peer's TCP socket for *our* connection:
+  /// local port == `peerPort`, foreign endpoint == 127.0.0.1:`listenPort`.
+  private func socketMatchesConnection(pid: pid_t, fdNum: Int32, peerPort: UInt16) -> Bool {
     var sinfo = socket_fdinfo()
     let result = proc_pidfdinfo(
       pid, fdNum, PROC_PIDFDSOCKETINFO,
@@ -129,8 +146,14 @@ final class AuthManager: Sendable {
           sinfo.psi.soi_kind == SOCKINFO_TCP else {
       return false
     }
-    let rawPort = sinfo.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport
-    let localPort = UInt16(bigEndian: UInt16(truncatingIfNeeded: rawPort))
-    return localPort == port
+    let tcp = sinfo.psi.soi_proto.pri_tcp.tcpsi_ini
+    let localPort = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.insi_lport))
+    let foreignPort = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.insi_fport))
+    let localAddr = tcp.insi_laddr.ina_46.i46a_addr4.s_addr
+    let foreignAddr = tcp.insi_faddr.ina_46.i46a_addr4.s_addr
+    return localPort == peerPort
+      && foreignPort == listenPort
+      && localAddr == loopbackAddr
+      && foreignAddr == loopbackAddr
   }
 }

@@ -32,13 +32,28 @@ fi
 sleep 1
 
 # ── Install binary ──────────────────────────────────────────────────
+# These paths live under the user's (user-writable) home but we run as root, so
+# a pre-planted symlink could redirect root's writes/chown/chmod outside the
+# intended directory. Refuse to operate through symlinks, and never chown -R
+# through a directory whose contents an unprivileged user may have pre-populated.
+if [ -L "$INSTALL_DIR" ]; then
+  echo "postinstall: ERROR — $INSTALL_DIR is a symlink, refusing" >&2
+  exit 1
+fi
 /bin/mkdir -p "$INSTALL_DIR"
+[ -L "$INSTALL_DIR/lidguard-helper" ] && /bin/rm -f "$INSTALL_DIR/lidguard-helper"
 /bin/cp -f "$PAYLOAD/lidguard-helper" "$INSTALL_DIR/"
-/usr/sbin/chown -R "$USERNAME:staff" "$INSTALL_DIR"
+/usr/sbin/chown "$USERNAME:staff" "$INSTALL_DIR" "$INSTALL_DIR/lidguard-helper"
 /bin/chmod 755 "$INSTALL_DIR/lidguard-helper"
 
 # ── Install LaunchAgent plist (resolve INSTALL_PATH placeholder) ────
-/bin/mkdir -p "$USER_HOME/Library/LaunchAgents"
+LA_DIR="$USER_HOME/Library/LaunchAgents"
+if [ -L "$LA_DIR" ]; then
+  echo "postinstall: ERROR — $LA_DIR is a symlink, refusing" >&2
+  exit 1
+fi
+/bin/mkdir -p "$LA_DIR"
+[ -L "$PLIST_DST" ] && /bin/rm -f "$PLIST_DST"
 /usr/bin/sed "s|INSTALL_PATH|$INSTALL_DIR|g" "$PAYLOAD/$LABEL.plist" > "$PLIST_DST"
 /usr/sbin/chown "$USERNAME:staff" "$PLIST_DST"
 /bin/chmod 644 "$PLIST_DST"

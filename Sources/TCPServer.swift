@@ -6,7 +6,18 @@ final class TCPServer: @unchecked Sendable {
   // All `nonisolated(unsafe)` fields below are only touched on `queue`.
   nonisolated(unsafe) private var listenSource: DispatchSourceRead?
   nonisolated(unsafe) private var connections: [Int32: ClientConnection] = [:]
+  nonisolated(unsafe) private var nextConnID: UInt64 = 0
+  // Auth-scan rate limiter (token bucket over a monotonic window).
+  nonisolated(unsafe) private var authWindowStart: UInt64 = 0
+  nonisolated(unsafe) private var authCountInWindow: Int = 0
   private let queue = DispatchQueue(label: "com.lidguard.helper.tcp")
+
+  /// Bound FDs/sources against a local peer opening many idle sockets.
+  private static let maxConnections = 16
+  /// Drop a peer that hasn't authenticated within this window (idle-hold DoS).
+  private static let authTimeoutSeconds = 5
+  /// Max `verifyPeer` scans/sec — each is an O(procs × fds) sweep (reconnect DoS).
+  private static let maxAuthScansPerSecond = 8
 
   private let authManager: AuthManager
   private let pmsetManager: PmsetManager
@@ -116,11 +127,20 @@ final class TCPServer: @unchecked Sendable {
     }
     guard clientFD >= 0 else { return }
 
+    // Cap concurrent connections so a local peer can't exhaust FDs / sources.
+    guard connections.count < Self.maxConnections else {
+      print("[TCPServer] Connection cap reached — rejecting fd=\(clientFD)")
+      close(clientFD)
+      return
+    }
+
     let flags = fcntl(clientFD, F_GETFL)
     _ = fcntl(clientFD, F_SETFL, flags | O_NONBLOCK)
 
+    nextConnID &+= 1
+    let connID = nextConnID
     let source = DispatchSource.makeReadSource(fileDescriptor: clientFD, queue: queue)
-    let conn = ClientConnection(fileDescriptor: clientFD, readSource: source)
+    let conn = ClientConnection(id: connID, fileDescriptor: clientFD, readSource: source)
     connections[clientFD] = conn
 
     source.setEventHandler { [weak self] in
@@ -133,6 +153,25 @@ final class TCPServer: @unchecked Sendable {
     }
     source.resume()
     print("[TCPServer] Client connected (fd=\(clientFD)), active=\(connections.count)")
+
+    // Drop peers that never authenticate; the id guards against fd reuse.
+    queue.asyncAfter(deadline: .now() + .seconds(Self.authTimeoutSeconds)) { [weak self] in
+      guard let self, let conn = self.connections[clientFD],
+            conn.id == connID, !conn.authenticated else { return }
+      print("[TCPServer] Auth timeout — dropping fd=\(clientFD)")
+      self.removeConnection(clientFD)
+    }
+  }
+
+  /// Token bucket over a 1s monotonic window bounding `verifyPeer` scans.
+  private func allowAuthScan() -> Bool {
+    let now = DispatchTime.now().uptimeNanoseconds
+    if now &- authWindowStart >= 1_000_000_000 {
+      authWindowStart = now
+      authCountInWindow = 0
+    }
+    authCountInWindow += 1
+    return authCountInWindow <= Self.maxAuthScansPerSecond
   }
 
   private func removeConnection(_ fileDescriptor: Int32) {
@@ -205,16 +244,26 @@ final class TCPServer: @unchecked Sendable {
   private func writeAll(fileDescriptor: Int32, bytes: [UInt8]) {
     var offset = 0
     let total = bytes.count
+    // Bound consecutive EAGAIN stalls so a peer that stops draining can't spin
+    // this serial queue forever (freezing broadcast + detection).
+    var eagainStalls = 0
+    let maxEagainStalls = 200  // ~200ms of 1ms sleeps with no progress
     while offset < total {
       let remaining = total - offset
       let wrote = bytes.withUnsafeBufferPointer { ptr -> Int in
         guard let base = ptr.baseAddress else { return -1 }
         return Darwin.write(fileDescriptor, base.advanced(by: offset), remaining)
       }
-      if wrote > 0 { offset += wrote; continue }
+      if wrote > 0 { offset += wrote; eagainStalls = 0; continue }
       if wrote < 0 {
         if errno == EINTR { continue }
         if errno == EAGAIN {
+          eagainStalls += 1
+          if eagainStalls > maxEagainStalls {
+            print("[TCPServer] write fd=\(fileDescriptor) stalled (EAGAIN) — disconnecting")
+            removeConnection(fileDescriptor)
+            return
+          }
           var delay = timespec(tv_sec: 0, tv_nsec: 1_000_000)
           _ = nanosleep(&delay, nil)
           continue
@@ -227,7 +276,6 @@ final class TCPServer: @unchecked Sendable {
       return
     }
   }
-
 }
 
 // MARK: - Command Dispatch
@@ -247,6 +295,12 @@ extension TCPServer {
 
     switch cmd.type {
     case "auth":
+      guard allowAuthScan() else {
+        // Rate-limited: refuse without running the expensive scan, then drop.
+        send(.authResult(false, version: nil), to: fileDescriptor)
+        removeConnection(fileDescriptor)
+        return
+      }
       let success = authManager.verifyPeer(fileDescriptor: fileDescriptor)
       connections[fileDescriptor]?.authenticated = success
       send(.authResult(success, version: success ? version : nil), to: fileDescriptor)
@@ -339,13 +393,4 @@ extension TCPServer {
     )
     send(status, to: fileDescriptor)
   }
-}
-
-// MARK: - Client Connection
-
-private struct ClientConnection {
-  let fileDescriptor: Int32
-  let readSource: DispatchSourceRead
-  var buffer: Data = Data()
-  var authenticated: Bool = false
 }
