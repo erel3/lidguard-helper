@@ -8,7 +8,6 @@ extension IPCMessage {
     IPCMessage(type: "auth_result", success: success, version: version)
   }
 
-  // swiftlint:disable:next function_parameter_count
   static func status(
     pmset: Bool, lockScreen: Bool, powerButton: Bool, accessibilityGranted: Bool,
     motion: Bool, motionSupported: Bool, motionSession: UInt64

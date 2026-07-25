@@ -16,8 +16,6 @@ import IOKit.hid
 
 // Physics-axis variable names (x/y/z) and byte indices (byte0..byte3)
 // are domain-correct short names; keeping them instead of verbose aliases.
-// swiftlint:disable identifier_name
-
 struct AccelerometerSample: Sendable {
   let x: Double  // g-force
   let y: Double
@@ -26,8 +24,6 @@ struct AccelerometerSample: Sendable {
 
   var magnitude: Double { (x * x + y * y + z * z).squareRoot() }
 }
-
-// swiftlint:enable identifier_name
 
 @MainActor
 protocol SensorReaderDelegate: AnyObject {
@@ -57,6 +53,22 @@ final class SensorReader {
   nonisolated static let appleVendorID: Int = 0x05AC
 
   weak var delegate: SensorReaderDelegate?
+
+  /// Why the last `start()` returned false.
+  ///
+  /// The distinction exists so callers can tell a retryable failure from a
+  /// permanent one. `openAndEnumerate` already logs the two cases separately —
+  /// an `IOHIDManagerOpen` failure (SPU driver not yet awake, sensor contended)
+  /// versus an empty device set (Intel Mac / plain M1, no SPU accelerometer at
+  /// all) — but returned nil for both, so MotionMonitor had to treat every
+  /// failure as permanent.
+  enum StartFailure {
+    /// Retrying later can succeed.
+    case transient
+    /// No SPU accelerometer on this Mac; retrying never will.
+    case unsupportedHardware
+  }
+  private(set) var lastStartFailure: StartFailure?
 
   private var manager: IOHIDManager?
   private var device: IOHIDDevice?
@@ -88,6 +100,7 @@ final class SensorReader {
   @discardableResult
   func start() -> Bool {
     guard manager == nil else { return device != nil }
+    lastStartFailure = nil
 
     // Wake SPU drivers: the BMI286 sensor is powered-down by default; we must
     // set three registry properties on every AppleSPUHIDDriver instance
@@ -104,14 +117,15 @@ final class SensorReader {
     IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
 
     guard let deviceSet = openAndEnumerate(mgr) else {
-      manager = mgr
+      abandon(mgr)
       delegate?.sensorReader(self, didChangeConnectionState: false)
       return false
     }
 
     guard let selected = selectAccelerometer(from: deviceSet) else {
       print("[SensorReader] No suitable device among matches.")
-      manager = mgr
+      lastStartFailure = .unsupportedHardware
+      abandon(mgr)
       delegate?.sensorReader(self, didChangeConnectionState: false)
       return false
     }
@@ -133,6 +147,21 @@ final class SensorReader {
     delegate?.sensorReader(self, didChangeConnectionState: true)
     print("[SensorReader] Streaming started")
     return true
+  }
+
+  /// Release a manager that failed to yield a usable device, leaving `manager`
+  /// nil so a later `start()` genuinely retries.
+  ///
+  /// Storing it instead makes the `guard manager == nil` at the top of `start()`
+  /// return `device != nil` — false — forever. Nothing clears the field either:
+  /// MotionMonitor latches `isHardwareSupported = false` and leaves
+  /// `isMonitoring` false, so its `stop()` early-returns and never reaches
+  /// `SensorReader.stop()`. One transient IOHIDManagerOpen failure at arm time
+  /// therefore kills motion detection for the whole helper lifetime.
+  private func abandon(_ mgr: IOHIDManager) {
+    IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+    IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+    manager = nil
   }
 
   func stop() {
@@ -195,10 +224,12 @@ final class SensorReader {
     guard openResult == kIOReturnSuccess else {
       print("[SensorReader] IOHIDManagerOpen failed: 0x\(String(openResult, radix: 16))")
       print("[SensorReader] Needs root; helper must run as root for SPU HID access.")
+      lastStartFailure = .transient
       return nil
     }
     guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
       print("[SensorReader] No SPU accelerometer device. Unsupported hardware (Intel or plain M1?).")
+      lastStartFailure = .unsupportedHardware
       return nil
     }
     logCandidates(set)
@@ -268,12 +299,10 @@ final class SensorReader {
   }
 
   nonisolated private static func readInt32LE(_ buffer: UnsafePointer<UInt8>, offset: Int) -> Int32 {
-    // swiftlint:disable identifier_name
     let b0 = Int32(buffer[offset])
     let b1 = Int32(buffer[offset + 1]) << 8
     let b2 = Int32(buffer[offset + 2]) << 16
     let b3 = Int32(buffer[offset + 3]) << 24
-    // swiftlint:enable identifier_name
     return b0 | b1 | b2 | b3
   }
 
@@ -283,7 +312,6 @@ final class SensorReader {
 }
 
 // IOKit's HID report callback ABI fixes these 7 params.
-// swiftlint:disable:next function_parameter_count
 private func hidReportCallback(
   context: UnsafeMutableRawPointer?,
   result: IOReturn,

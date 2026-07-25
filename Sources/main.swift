@@ -98,7 +98,7 @@ let sigSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 sigSource.setEventHandler {
   MainActor.assumeIsolated {
     print("[Helper] SIGTERM received, cleaning up")
-    pmsetManager.disable()
+    pmsetManager.disableSync()
     lockScreenManager.hide()
     powerButtonMonitor.stop()
     motionMonitor.stop()
@@ -128,7 +128,7 @@ idleTimer.setEventHandler {
       idleSeconds += 5
       if idleSeconds >= 30 && consecutiveIdleTicks >= 2 {
         print("[Helper] Idle timeout (30s, \(consecutiveIdleTicks) ticks), exiting")
-        pmsetManager.disable()
+        pmsetManager.disableSync()
         lockScreenManager.hide()
         powerButtonMonitor.stop()
         motionMonitor.stop()

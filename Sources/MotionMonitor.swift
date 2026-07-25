@@ -70,10 +70,14 @@ final class MotionMonitor: SensorReaderDelegate {
   private var lastFireTime: TimeInterval = 0
   nonisolated(unsafe) private(set) var isMonitoring = false
 
-  /// Optimistic until proven false. On a failed `start()` (device missing,
-  /// no root, unsupported hardware) this flips to false and stays false
-  /// for the helper's lifetime. Used by the status message so the main app
-  /// can hide the Motion toggle on unsupported Macs.
+  /// Optimistic until proven false. Flips to false — permanently, for the
+  /// helper's lifetime — only when `SensorReader` reports that this Mac has no
+  /// SPU accelerometer at all. Used by the status message so the main app can
+  /// hide the Motion toggle on unsupported Macs.
+  ///
+  /// A *transient* start failure must not latch it: one contended
+  /// `IOHIDManagerOpen` at arm time would otherwise hide the Motion toggle on
+  /// perfectly capable hardware until the user quit the app.
   nonisolated(unsafe) private(set) var isHardwareSupported: Bool = true
 
   init(sensorReader: SensorReader = SensorReader()) {
@@ -87,7 +91,9 @@ final class MotionMonitor: SensorReaderDelegate {
     resetState()
     let started = sensorReader.start()
     isMonitoring = started
-    if !started { isHardwareSupported = false }
+    if !started, sensorReader.lastStartFailure == .unsupportedHardware {
+      isHardwareSupported = false
+    }
     if started {
       currentSession &+= 1
       print("[MotionMonitor] Started session \(currentSession); calibrating...")

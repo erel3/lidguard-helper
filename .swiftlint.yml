@@ -1,0 +1,44 @@
+# Kept in sync with lidguard/.swiftlint.yml. The two repos are distributed
+# independently and cannot share a config file (see the T3-J decision: a path
+# dependency breaks standalone clones), so this is a deliberate duplicate —
+# change both or neither.
+#
+# Without this file the helper linted under SwiftLint's defaults while the app
+# used the limits below, so the same code was legal in one repo and an error in
+# the other. `--strict` promotes every warning to an error, which made the
+# default file_length of 400 a hard cap here: TCPServer.swift sits at 396.
+
+excluded:
+  - .build
+  - dist
+
+disabled_rules:
+  - trailing_comma
+  - statement_position
+
+identifier_name:
+  min_length: 1
+  max_length: 60
+
+type_name:
+  max_length: 60
+
+line_length:
+  warning: 160
+  error: 200
+
+file_length:
+  warning: 800
+  error: 1200
+
+type_body_length:
+  warning: 600
+  error: 900
+
+function_body_length:
+  warning: 80
+  error: 120
+
+function_parameter_count:
+  warning: 8
+  error: 12
