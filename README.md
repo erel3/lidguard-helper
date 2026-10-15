@@ -26,7 +26,7 @@
 
 🛡️ **Clamshell Sleep Prevention** — `sudo pmset disablesleep` via sudoers\
 🔒 **Lock Screen Overlay** — fullscreen "STOLEN DEVICE" window via SkyLight private API\
-⚡ **Power Button Detection** — NSEvent system-defined events (requires Accessibility)\
+⚡ **Power Button Detection** — NSEvent system-defined events (requires Accessibility, named "Device Control and Data Access" on macOS 27+)\
 🤚 **Motion Detection** — tilt + walking detector reading the Apple Silicon accelerometer (Bosch BMI286 IMU) via IOKit HID at ~800 Hz; root-only, hence run from the helper
 
 ## How It Works
@@ -96,7 +96,7 @@ Newline-delimited JSON over localhost TCP port 51423.
 
 | Permission | Why |
 |:-----------|:----|
-| **Accessibility** | Power button detection via NSEvent |
+| **Accessibility** ("Device Control and Data Access" on macOS 27+) | Power button detection via NSEvent |
 | **Sudoers** | `pmset disablesleep` requires root |
 | **Root (via launchd)** | IOKit HID accelerometer access for motion detection |
 

@@ -374,11 +374,20 @@ extension TCPServer {
 
   fileprivate func lockSystemScreen() {
     let libHandle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY)
-    guard libHandle != nil else { return }
-    guard let sym = dlsym(libHandle, "SACLockScreenImmediate") else { return }
-    typealias LockFunction = @convention(c) () -> Void
+    guard libHandle != nil else {
+      print("[TCPServer] login.framework dlopen failed — screen not locked")
+      return
+    }
+    guard let sym = dlsym(libHandle, "SACLockScreenImmediate") else {
+      print("[TCPServer] SACLockScreenImmediate not found — screen not locked")
+      return
+    }
+    typealias LockFunction = @convention(c) () -> Int32
     let lock = unsafeBitCast(sym, to: LockFunction.self)
-    lock()
+    let result = lock()
+    if result != 0 {
+      print("[TCPServer] SACLockScreenImmediate returned \(result)")
+    }
   }
 
   fileprivate func sendStatus(to fileDescriptor: Int32) {
